@@ -8,7 +8,7 @@ const newMsg = (role, content = '') => ({ id: ++msgIdCounter, role, content })
 const isOpen = ref(false)
 const input = ref('')
 const loading = ref(false)
-const messages = ref([newMsg('assistant', '你好！我是 DeepSeek 助手，有什么可以帮你的吗？')])
+const messages = ref([newMsg('assistant', '你好！我是 AI 助手，有什么可以帮你的吗？')])
 
 const messagesRef = ref(null)
 
@@ -110,7 +110,7 @@ function clearChat() {
           <div class="panel-title">
             <span class="avatar">AI</span>
             <div>
-              <strong>DeepSeek 助手</strong>
+              <strong>AI 助手</strong>
               <span class="status">{{ loading ? '正在输入…' : '在线' }}</span>
             </div>
           </div>

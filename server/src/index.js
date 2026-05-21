@@ -6,22 +6,71 @@ dotenv.config()
 
 const app = express()
 const PORT = process.env.PORT || 3001
-const API_KEY = process.env.DEEPSEEK_API_KEY?.trim().replace(/^['"]|['"]$/g, '')
-const BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
-const MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
+
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY?.trim().replace(/^['"]|['"]$/g, '')
+const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
+
+const QWEN_API_KEY = process.env.QWEN_API_KEY?.trim().replace(/^['"]|['"]$/g, '')
+const QWEN_BASE_URL = process.env.QWEN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+const QWEN_MODEL = process.env.QWEN_MODEL || 'qwen-max'
+
+const PRIMARY_MODEL = process.env.PRIMARY_MODEL || 'qwen'
+let currentModel = PRIMARY_MODEL
+let lastSwitchTime = 0
+const FALLBACK_COOLDOWN_MS = 10 * 60 * 1000
+
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || ''
-// 上游请求超时（毫秒），默认 60 秒
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '60000', 10)
-// CORS 允许的来源，多个用逗号分隔，留空则允许全部
 const CORS_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map((s) => s.trim())
   : null
+
+function getModelConfig() {
+  if (currentModel === 'qwen') {
+    return {
+      apiKey: QWEN_API_KEY,
+      baseUrl: QWEN_BASE_URL,
+      model: QWEN_MODEL,
+      name: 'Qwen（千问）',
+    }
+  }
+  return {
+    apiKey: DEEPSEEK_API_KEY,
+    baseUrl: DEEPSEEK_BASE_URL,
+    model: DEEPSEEK_MODEL,
+    name: 'DeepSeek',
+  }
+}
+
+function switchToBackup(now) {
+  currentModel = currentModel === 'qwen' ? 'deepseek' : 'qwen'
+  lastSwitchTime = now
+  console.log(`[模型切换] 已切换到 ${currentModel === 'qwen' ? 'Qwen（千问）' : 'DeepSeek'}`)
+}
+
+function isOverloadError(response, errText) {
+  if (response.status === 429 || response.status === 503) return true
+  const lower = (errText || '').toLowerCase()
+  return (
+    lower.includes('overload') ||
+    lower.includes('high demand') ||
+    lower.includes('too many requests') ||
+    lower.includes('rate limit') ||
+    lower.includes('flow control') ||
+    lower.includes('throttling') ||
+    lower.includes('server busy') ||
+    lower.includes('service unavailable') ||
+    lower.includes('服务器繁忙') ||
+    lower.includes('服务暂不可用') ||
+    lower.includes('当前负载过高')
+  )
+}
 
 app.use(
   cors({
     origin: CORS_ORIGINS
       ? (origin, cb) => {
-          // 允许无 origin（如 curl/服务端请求）或在白名单内的来源
           if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true)
           cb(new Error(`CORS: origin ${origin} not allowed`))
         }
@@ -31,13 +80,15 @@ app.use(
 app.use(express.json({ limit: '4mb' }))
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, model: MODEL })
+  res.json({ ok: true, model: currentModel === 'qwen' ? QWEN_MODEL : DEEPSEEK_MODEL, currentModel })
 })
 
 app.post('/api/chat', async (req, res) => {
-  if (!API_KEY) {
-    res.status(500).json({ error: '未配置 DEEPSEEK_API_KEY，请在 server/.env 中设置' })
-    return
+  const now = Date.now()
+  if (currentModel !== PRIMARY_MODEL && now - lastSwitchTime >= FALLBACK_COOLDOWN_MS) {
+    currentModel = PRIMARY_MODEL
+    lastSwitchTime = 0
+    console.log(`[模型回切] 已回切到主模型 ${PRIMARY_MODEL === 'qwen' ? 'Qwen（千问）' : 'DeepSeek'}`)
   }
 
   const { messages, stream = true } = req.body
@@ -47,89 +98,135 @@ app.post('/api/chat', async (req, res) => {
     return
   }
 
-  // 若配置了系统提示词，自动注入到消息列表最前面
   const fullMessages = SYSTEM_PROMPT
     ? [{ role: 'system', content: SYSTEM_PROMPT }, ...messages]
     : messages
 
-  // 用 AbortController 同时处理：客户端断开 & 请求超时
   const ac = new AbortController()
+  let completed = false
+  let timeoutId = setTimeout(() => ac.abort(new Error('upstream timeout')), UPSTREAM_TIMEOUT_MS)
 
-  // 超时自动 abort
-  const timeoutId = setTimeout(() => ac.abort(new Error('upstream timeout')), UPSTREAM_TIMEOUT_MS)
-
-  // 客户端断开时也 abort，避免继续消耗上游资源
-  req.on('close', () => {
+  const cleanup = () => {
     clearTimeout(timeoutId)
-    ac.abort(new Error('client disconnected'))
-  })
+    res.off('close', onClientClose)
+  }
 
-  try {
-    const response = await fetch(`${BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: fullMessages,
-        stream,
-      }),
-      signal: ac.signal,
-    })
+  const onClientClose = () => {
+    if (!completed && !res.writableEnded) {
+      ac.abort(new Error('client disconnected'))
+    }
+  }
+  res.on('close', onClientClose)
 
-    clearTimeout(timeoutId)
+  let lastError = null
 
-    if (!response.ok) {
-      const errText = await response.text()
-      res.status(response.status).json({ error: errText || 'DeepSeek API 请求失败' })
-      return
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const config = getModelConfig()
+
+    if (!config.apiKey) {
+      if (attempt === 0) {
+        console.warn(`[${config.name}] API 密钥未配置，尝试备用模型`)
+        switchToBackup(now)
+        continue
+      }
+      lastError = new Error(`${config.name} 未配置 API 密钥`)
+      break
     }
 
-    if (!stream) {
-      const data = await response.json()
-      res.json(data)
-      return
-    }
+    try {
+      const response = await fetch(`${config.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: fullMessages,
+          stream,
+        }),
+        signal: ac.signal,
+      })
 
-    res.setHeader('Content-Type', 'text/event-stream')
-    res.setHeader('Cache-Control', 'no-cache')
-    res.setHeader('Connection', 'keep-alive')
-    // 禁用 Nginx 缓冲，确保 SSE 实时到达客户端
-    res.setHeader('X-Accel-Buffering', 'no')
-    res.flushHeaders()
+      if (!response.ok) {
+        const errText = await response.text()
+        if (attempt === 0 && isOverloadError(response, errText)) {
+          console.log(`[${config.name}] 负载过高，切换到备用模型重试`)
+          switchToBackup(now)
+          clearTimeout(timeoutId)
+          timeoutId = setTimeout(() => ac.abort(new Error('upstream timeout')), UPSTREAM_TIMEOUT_MS)
+          continue
+        }
+        completed = true
+        cleanup()
+        res.status(response.status).json({ error: errText || `${config.name} API 请求失败` })
+        return
+      }
 
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
+      clearTimeout(timeoutId)
 
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      res.write(decoder.decode(value, { stream: true }))
-    }
+      if (!stream) {
+        const data = await response.json()
+        completed = true
+        cleanup()
+        res.json(data)
+        return
+      }
 
-    res.end()
-  } catch (err) {
-    clearTimeout(timeoutId)
-    // 客户端主动断开或超时属于正常流程，不需要打印错误
-    if (err.name !== 'AbortError') {
-      console.error('Chat API error:', err)
-    }
-    if (!res.headersSent) {
-      const isTimeout = err.message === 'upstream timeout'
-      res
-        .status(isTimeout ? 504 : 500)
-        .json({ error: isTimeout ? '上游请求超时，请稍后重试' : err.message || '服务器内部错误' })
-    } else {
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Connection', 'keep-alive')
+      res.setHeader('X-Accel-Buffering', 'no')
+      res.flushHeaders()
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        res.write(decoder.decode(value, { stream: true }))
+      }
+
+      completed = true
+      cleanup()
       res.end()
+      return
+
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        cleanup()
+        if (!res.headersSent) {
+          const isTimeout = err.message === 'upstream timeout'
+          res
+            .status(isTimeout ? 504 : 500)
+            .json({ error: isTimeout ? '上游请求超时，请稍后重试' : err.message || '服务器内部错误' })
+        } else {
+          res.end()
+        }
+        return
+      }
+
+      if (attempt === 0) {
+        console.log(`[${config.name}] 请求异常: ${err.message}，切换到备用模型重试`)
+        switchToBackup(now)
+        clearTimeout(timeoutId)
+        timeoutId = setTimeout(() => ac.abort(new Error('upstream timeout')), UPSTREAM_TIMEOUT_MS)
+        continue
+      }
+      lastError = err
     }
+  }
+
+  cleanup()
+  if (!res.headersSent) {
+    res.status(503).json({ error: lastError?.message || '所有模型均不可用，请稍后重试' })
   }
 })
 
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`)
-  if (!API_KEY) {
-    console.warn('警告: 未设置 DEEPSEEK_API_KEY，请在 server/.env 中配置')
-  }
+  console.log(`主模型: ${PRIMARY_MODEL === 'qwen' ? 'Qwen（千问）' : 'DeepSeek'} | 当前: ${currentModel === 'qwen' ? 'Qwen（千问）' : 'DeepSeek'}`)
+  if (!DEEPSEEK_API_KEY) console.warn('警告: 未设置 DEEPSEEK_API_KEY')
+  if (!QWEN_API_KEY) console.warn('警告: 未设置 QWEN_API_KEY')
 })

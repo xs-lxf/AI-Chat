@@ -6,7 +6,7 @@ import ChatWidget from './components/ChatWidget.vue'
   <div class="page">
     <header class="hero">
       <h1>AI Chat</h1>
-      <p>基于 Vue 3 + DeepSeek API 的智能对话助手</p>
+      <p>智能对话助手</p>
       <p class="hint">点击右下角悬浮按钮开始聊天</p>
     </header>
     <ChatWidget />

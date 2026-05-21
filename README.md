@@ -1,6 +1,8 @@
 # AI Chat
 
-基于 **Vue 3 + Express + DeepSeek API** 的智能对话应用。页面右下角有悬浮按钮，点击后弹出聊天面板，支持流式逐字输出、停止生成、清空对话，API Key 安全保存在服务端。
+基于 **Vue 3 + Express + 多模型 AI API** 的智能对话应用。页面右下角有悬浮按钮，点击后弹出聊天面板，支持流式逐字输出、停止生成、清空对话，API Key 安全保存在服务端。
+
+内置 **千问（Qwen）** 与 **DeepSeek** 双模型，当主模型负载过高时自动切换到备用模型并重试，10 分钟后自动回切。
 
 ---
 
@@ -42,7 +44,7 @@ npm run install:all
 
 ### 第二步：配置 API Key
 
-前往 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 申请 API Key，然后复制配置文件：
+复制配置文件：
 
 ```bash
 cp server/.env.example server/.env
@@ -51,6 +53,10 @@ cp server/.env.example server/.env
 打开 `server/.env`，填入你的密钥：
 
 ```env
+# 主模型：千问（Qwen）
+QWEN_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
+
+# 备用模型：DeepSeek
 DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
@@ -79,40 +85,36 @@ npm run dev
 
 所有配置均在 `server/.env` 中设置，以下是完整的配置项列表：
 
-### 必填
-
-| 变量名 | 说明 |
-|--------|------|
-| `DEEPSEEK_API_KEY` | DeepSeek API 密钥，格式 `sk-xxxxxxxx` |
-
-### 可选（均有默认值）
+### 模型配置
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `DEEPSEEK_BASE_URL` | API 接入地址，兼容其他 OpenAI 格式服务 | `https://api.deepseek.com` |
-| `DEEPSEEK_MODEL` | 使用的模型名称 | `deepseek-chat` |
+| `QWEN_API_KEY` | 千问 API 密钥，格式 `sk-xxxxxxxx` | — |
+| `QWEN_BASE_URL` | 千问 API 接入地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `QWEN_MODEL` | 千问使用的模型 | `qwen-max` |
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥，格式 `sk-xxxxxxxx` | — |
+| `DEEPSEEK_BASE_URL` | DeepSeek API 接入地址 | `https://api.deepseek.com` |
+| `DEEPSEEK_MODEL` | DeepSeek 使用的模型 | `deepseek-chat` |
+| `PRIMARY_MODEL` | 主模型，可选 `qwen` 或 `deepseek` | `qwen` |
+
+> 至少需要配置一个模型的 API Key 才能使用。两个都配置时可获得自动容灾能力。
+
+### 通用配置
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
 | `PORT` | 后端监听端口 | `3001` |
 | `SYSTEM_PROMPT` | 系统提示词，注入到每次对话的最前面 | 空（不注入） |
 | `UPSTREAM_TIMEOUT_MS` | 上游 API 请求超时时间（毫秒） | `60000`（60 秒） |
 | `CORS_ORIGINS` | 允许跨域的来源，多个用英文逗号分隔，留空不限制 | 空（允许所有来源） |
 
-**配置示例：**
+### 自动容灾
 
-```env
-DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
+当主模型返回过载错误（HTTP 429/503 或包含 overload/服务器繁忙 等关键字）时，系统会自动：
 
-# 使用推理模型
-DEEPSEEK_MODEL=deepseek-reasoner
-
-# 给 AI 设定角色
-SYSTEM_PROMPT=你是一名资深前端工程师，请用简洁专业的中文回答问题，代码用 markdown 格式输出。
-
-# 生产环境限制来源，避免他人调用
-CORS_ORIGINS=https://yourdomain.com
-
-# 适当延长超时，防止复杂问题被截断
-UPSTREAM_TIMEOUT_MS=120000
-```
+1. **切换模型**：立即切换到备用模型
+2. **自动重试**：用备用模型重新发送当前请求，用户无感知
+3. **定时回切**：10 分钟后自动将主模型恢复为首选模型
 
 ---
 
@@ -160,7 +162,7 @@ AI-Chat/
 │
 ├── server/                  # 后端（Node.js + Express）
 │   ├── src/
-│   │   └── index.js         # 唯一入口：代理 DeepSeek API，处理 SSE 流
+│   │   └── index.js         # 入口：代理多模型 API，处理 SSE 流，自动容灾
 │   ├── .env                 # 本地配置（不提交）
 │   ├── .env.example         # 配置模板
 │   └── package.json
@@ -249,12 +251,9 @@ app.get('*', (_req, res) => {
 
 ## 常见问题
 
-**Q：启动后访问页面，发送消息提示"未配置 DEEPSEEK_API_KEY"**
+**Q：启动后访问页面，发送消息提示未配置 API Key**
 
-确认 `server/.env` 文件存在，且内容格式正确（不带引号、不带多余空格）：
-```
-DEEPSEEK_API_KEY=sk-xxxxxxxx
-```
+确认 `server/.env` 文件存在，且至少配置了 `QWEN_API_KEY` 或 `DEEPSEEK_API_KEY` 中的一个，格式正确（不带引号、不带多余空格）。
 
 ---
 
@@ -266,11 +265,13 @@ DEEPSEEK_API_KEY=sk-xxxxxxxx
 
 **Q：想换用其他兼容 OpenAI 格式的模型（如本地 Ollama）**
 
-修改 `server/.env`：
+修改 `server/.env`，例如使用本地 Ollama：
+
 ```env
 DEEPSEEK_BASE_URL=http://localhost:11434/v1
 DEEPSEEK_MODEL=qwen2.5:7b
-DEEPSEEK_API_KEY=ollama   # 占位符，非空即可
+DEEPSEEK_API_KEY=ollama
+PRIMARY_MODEL=deepseek
 ```
 
 ---
@@ -284,8 +285,8 @@ function buildApiMessages() {
   return messages.value
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .map(({ role, content }) => ({ role, content }))
-    .slice(-10)   // 只保留最近 10 条
-    .slice(0, -1) // 去掉末尾的空占位
+    .slice(-10)
+    .slice(0, -1)
 }
 ```
 
@@ -294,9 +295,16 @@ function buildApiMessages() {
 **Q：如何让 AI 扮演特定角色或专注某个领域？**
 
 在 `server/.env` 中配置 `SYSTEM_PROMPT`，无需修改代码：
+
 ```env
 SYSTEM_PROMPT=你是一名专业的法律顾问，只回答与中国法律相关的问题，用简洁易懂的语言解释。
 ```
+
+---
+
+**Q：主模型过载了会怎样？**
+
+系统会自动切换到备用模型并重试当前请求。切换后 10 分钟，会自动恢复首选模型。整个过程无需手动干预。
 
 ---
 
@@ -308,5 +316,5 @@ SYSTEM_PROMPT=你是一名专业的法律顾问，只回答与中国法律相关
 | 前端构建 | Vite 6 |
 | 后端框架 | Express 4 |
 | 运行时 | Node.js 18+（原生 fetch） |
-| AI 接口 | DeepSeek Chat Completions API（OpenAI 兼容） |
+| AI 接口 | 千问 / DeepSeek Chat Completions API（OpenAI 兼容） |
 | 流式传输 | Server-Sent Events（SSE） |
