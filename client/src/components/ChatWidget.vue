@@ -48,6 +48,43 @@ const messagesRef = ref(null)
 
 const lastContent = computed(() => messages.value[messages.value.length - 1]?.content ?? '')
 
+let charBuffer = ''
+let typeTimer = null
+
+function typeChar() {
+  if (charBuffer.length === 0) {
+    typeTimer = null
+    return
+  }
+  const msgs = currentSession.value?.messages
+  if (!msgs || msgs.length === 0) {
+    flushBuffer()
+    return
+  }
+  const last = msgs[msgs.length - 1]
+  if (last.role !== 'assistant') {
+    flushBuffer()
+    return
+  }
+  last.content += charBuffer[0]
+  charBuffer = charBuffer.slice(1)
+  typeTimer = setTimeout(typeChar, 25)
+}
+
+function flushBuffer() {
+  if (typeTimer) {
+    clearTimeout(typeTimer)
+    typeTimer = null
+  }
+  if (!charBuffer) return
+  const msgs = currentSession.value?.messages
+  if (msgs && msgs.length > 0) {
+    const last = msgs[msgs.length - 1]
+    if (last.role === 'assistant') last.content += charBuffer
+  }
+  charBuffer = ''
+}
+
 createSession(true)
 
 function switchSession(id) {
@@ -127,9 +164,11 @@ async function sendMessage() {
   await streamChat(
     apiMessages,
     (chunk) => {
-      assistantMsg.content += chunk
+      charBuffer += chunk
+      if (!typeTimer) typeChar()
     },
     () => {
+      flushBuffer()
       if (session) {
         session.loading = false
         session.abortController = null
@@ -139,6 +178,7 @@ async function sendMessage() {
       }
     },
     (err) => {
+      flushBuffer()
       if (session) {
         session.loading = false
         session.abortController = null
@@ -150,6 +190,7 @@ async function sendMessage() {
 }
 
 function stopGenerating() {
+  flushBuffer()
   const session = currentSession.value
   if (!session || !session.abortController) return
   session.abortController.abort()
