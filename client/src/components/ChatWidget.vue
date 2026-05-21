@@ -1,22 +1,79 @@
 <script setup>
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { streamChat } from '../api/chat.js'
 
 let msgIdCounter = 0
+let sessionIdCounter = 0
 const newMsg = (role, content = '') => ({ id: ++msgIdCounter, role, content })
 
-const isOpen = ref(false)
-const input = ref('')
-const loading = ref(false)
-const messages = ref([newMsg('assistant', '你好！我是 AI 助手，有什么可以帮你的吗？')])
+const sessions = ref([])
+const activeSessionId = ref(null)
+const showSidebar = ref(false)
 
+function createSession(isDefault = false) {
+  const session = reactive({
+    id: ++sessionIdCounter,
+    name: isDefault ? '默认对话' : '新对话 ' + sessionIdCounter,
+    messages: [newMsg('assistant', '你好！我是 AI 助手，有什么可以帮你的吗？')],
+    input: '',
+    loading: false,
+    abortController: null,
+  })
+  sessions.value.push(session)
+  activeSessionId.value = session.id
+  return session
+}
+
+const currentSession = computed(() => sessions.value.find((s) => s.id === activeSessionId.value))
+
+const messages = computed({
+  get: () => currentSession.value?.messages ?? [],
+  set: (val) => {
+    if (currentSession.value) currentSession.value.messages = val
+  },
+})
+
+const input = computed({
+  get: () => currentSession.value?.input ?? '',
+  set: (val) => {
+    if (currentSession.value) currentSession.value.input = val
+  },
+})
+
+const loading = computed(() => currentSession.value?.loading ?? false)
+const sessionCount = computed(() => sessions.value.length)
+
+const isOpen = ref(false)
 const messagesRef = ref(null)
 
-// 当前正在进行的请求控制器，用于"停止生成"
-let abortController = null
-
-// 最后一条消息的内容——流式输出时此值不断变化，触发滚动
 const lastContent = computed(() => messages.value[messages.value.length - 1]?.content ?? '')
+
+createSession(true)
+
+function switchSession(id) {
+  if (loading.value) return
+  activeSessionId.value = id
+  showSidebar.value = false
+}
+
+function deleteSession(id) {
+  const idx = sessions.value.findIndex((s) => s.id === id)
+  if (idx === -1) return
+  const session = sessions.value[idx]
+  if (session.abortController) session.abortController.abort()
+  sessions.value.splice(idx, 1)
+  if (sessions.value.length === 0) {
+  createSession()
+  } else if (activeSessionId.value === id) {
+    activeSessionId.value = sessions.value[Math.min(idx, sessions.value.length - 1)].id
+  }
+}
+
+function newSession() {
+  if (loading.value) return
+  showSidebar.value = false
+  createSession()
+}
 
 async function scrollToBottom() {
   await nextTick()
@@ -25,7 +82,6 @@ async function scrollToBottom() {
   }
 }
 
-// 同时监听消息数量和最后一条内容变化，保证流式输出时也能自动滚动
 watch(() => messages.value.length, scrollToBottom)
 watch(lastContent, scrollToBottom)
 
@@ -34,11 +90,21 @@ function togglePanel() {
 }
 
 function buildApiMessages() {
-  // 取出 user/assistant 消息，去掉最后一条空白占位（assistant 正在回复中）
   return messages.value
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .map(({ role, content }) => ({ role, content }))
     .slice(0, -1)
+}
+
+function autoNameSession() {
+  const session = currentSession.value
+  if (!session || session.name !== '新对话') return
+  const firstUser = session.messages.find((m) => m.role === 'user')
+  if (firstUser) {
+    session.name = firstUser.content.length > 20
+      ? firstUser.content.slice(0, 20) + '…'
+      : firstUser.content
+  }
 }
 
 async function sendMessage() {
@@ -47,12 +113,15 @@ async function sendMessage() {
 
   messages.value.push(newMsg('user', text))
   input.value = ''
+  autoNameSession()
 
   const assistantMsg = newMsg('assistant', '')
   messages.value.push(assistantMsg)
-  loading.value = true
+  const session = currentSession.value
+  if (session) session.loading = true
 
-  abortController = new AbortController()
+  const ac = new AbortController()
+  if (session) session.abortController = ac
   const apiMessages = buildApiMessages()
 
   await streamChat(
@@ -61,28 +130,31 @@ async function sendMessage() {
       assistantMsg.content += chunk
     },
     () => {
-      loading.value = false
-      abortController = null
+      if (session) {
+        session.loading = false
+        session.abortController = null
+      }
       if (!assistantMsg.content) {
         assistantMsg.content = '（无回复内容）'
       }
     },
     (err) => {
-      loading.value = false
-      abortController = null
+      if (session) {
+        session.loading = false
+        session.abortController = null
+      }
       assistantMsg.content = `错误：${err}`
     },
-    abortController.signal,
+    ac.signal,
   )
 }
 
 function stopGenerating() {
-  if (abortController) {
-    abortController.abort()
-    abortController = null
-  }
-  loading.value = false
-  // 如果当前回复为空，给一个提示
+  const session = currentSession.value
+  if (!session || !session.abortController) return
+  session.abortController.abort()
+  session.abortController = null
+  session.loading = false
   const last = messages.value[messages.value.length - 1]
   if (last?.role === 'assistant' && !last.content) {
     last.content = '（已停止生成）'
@@ -108,14 +180,29 @@ function clearChat() {
       <div v-if="isOpen" class="chat-panel">
         <header class="panel-header">
           <div class="panel-title">
+            <button type="button" class="icon-btn menu-btn" title="对话列表" @click="showSidebar = !showSidebar">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
             <span class="avatar">AI</span>
-            <div>
+            <div class="title-info">
               <strong>AI 助手</strong>
-              <span class="status">{{ loading ? '正在输入…' : '在线' }}</span>
+              <span class="status">
+                <svg class="status-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+                </svg>
+                {{ currentSession?.name ?? '新对话' }}
+              </span>
             </div>
           </div>
           <div class="panel-actions">
-            <button type="button" class="icon-btn" title="清空对话" @click="clearChat">
+            <button type="button" class="icon-btn" title="新对话" @click="newSession">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+            <button type="button" class="icon-btn" title="清空当前对话" @click="clearChat">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z" />
               </svg>
@@ -128,34 +215,83 @@ function clearChat() {
           </div>
         </header>
 
-        <div ref="messagesRef" class="messages">
-          <div
-            v-for="(msg, i) in messages"
-            :key="msg.id"
-            class="message"
-            :class="msg.role"
-          >
-            <div class="bubble">
-              {{ msg.content }}
-              <!-- 在流式输出时，光标始终显示在回复末尾 -->
-              <span
-                v-if="loading && i === messages.length - 1 && msg.role === 'assistant'"
-                class="cursor"
-              >▋</span>
+        <div class="panel-body">
+          <Transition name="sidebar">
+            <aside v-if="showSidebar" class="sidebar">
+              <div class="sidebar-header">
+                <span>对话列表</span>
+                <button type="button" class="icon-btn" title="关闭列表" @click="showSidebar = false">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M18 6L6 18M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div class="sidebar-list">
+                <div
+                  v-for="s in sessions"
+                  :key="s.id"
+                  class="sidebar-item"
+                  :class="{ active: s.id === activeSessionId }"
+                  @click="switchSession(s.id)"
+                >
+                  <span class="sidebar-item-dot">
+                    <svg v-if="s.id === activeSessionId" width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                    </svg>
+                    <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+                    </svg>
+                  </span>
+                  <span class="sidebar-item-name">{{ s.name }}</span>
+                  <button
+                    v-if="sessions.length > 1"
+                    class="sidebar-item-del"
+                    title="删除此对话"
+                    @click.stop="deleteSession(s.id)"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+              <button class="sidebar-new" @click="newSession">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                新建对话
+              </button>
+            </aside>
+          </Transition>
+
+          <div ref="messagesRef" class="messages">
+            <div
+              v-for="(msg, i) in messages"
+              :key="msg.id"
+              class="message"
+              :class="msg.role"
+            >
+              <div class="bubble">
+                {{ msg.content }}
+                <span
+                  v-if="loading && i === messages.length - 1 && msg.role === 'assistant'"
+                  class="cursor"
+                >▋</span>
+              </div>
             </div>
           </div>
         </div>
 
         <footer class="panel-footer">
           <textarea
-            v-model="input"
+            :value="input"
             class="input"
             placeholder="输入消息，Enter 发送…"
             rows="2"
             :disabled="loading"
+            @input="input = $event.target.value"
             @keydown="onKeydown"
           />
-          <!-- 生成中：显示"停止"按钮；否则显示发送按钮 -->
           <button
             v-if="loading"
             type="button"
@@ -256,38 +392,63 @@ function clearChat() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 16px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  gap: 4px;
 }
 
 .panel-title {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.menu-btn {
+  flex-shrink: 0;
 }
 
 .avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
   background: linear-gradient(135deg, var(--accent), #7c5cff);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   font-weight: 600;
   color: #fff;
+  flex-shrink: 0;
+}
+
+.title-info {
+  min-width: 0;
 }
 
 .panel-title strong {
   display: block;
-  font-size: 0.95rem;
+  font-size: 0.9rem;
+  line-height: 1.3;
 }
 
 .status {
-  font-size: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.7rem;
   color: var(--text-muted);
+  line-height: 1.2;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.status-icon {
+  flex-shrink: 0;
+  opacity: 0.5;
 }
 
 .panel-actions {
@@ -312,6 +473,135 @@ function clearChat() {
 .icon-btn:hover {
   background: var(--surface-hover);
   color: var(--text);
+}
+
+.panel-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  position: relative;
+}
+
+.sidebar {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+  font-size: 0.85rem;
+  margin-bottom: 2px;
+}
+
+.sidebar-item:hover {
+  background: var(--surface-hover);
+}
+
+.sidebar-item.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.sidebar-item-dot {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.5;
+}
+
+.sidebar-item.active .sidebar-item-dot {
+  opacity: 1;
+}
+
+.sidebar-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-item-del {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.4;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.sidebar-item:hover .sidebar-item-del {
+  opacity: 0.7;
+}
+
+.sidebar-item.active .sidebar-item-del {
+  opacity: 0.8;
+}
+
+.sidebar-item-del:hover {
+  opacity: 1 !important;
+  background: rgba(255, 77, 79, 0.25);
+  color: #ff4d4f;
+}
+
+.sidebar-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 8px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.sidebar-new:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .messages {
@@ -430,6 +720,7 @@ function clearChat() {
   color: #ff4d4f;
 }
 
+/* Transitions */
 .panel-enter-active,
 .panel-leave-active {
   transition: opacity 0.2s, transform 0.2s;
@@ -439,6 +730,17 @@ function clearChat() {
 .panel-leave-to {
   opacity: 0;
   transform: translateY(12px) scale(0.96);
+}
+
+.sidebar-enter-active,
+.sidebar-leave-active {
+  transition: opacity 0.15s, transform 0.15s;
+}
+
+.sidebar-enter-from,
+.sidebar-leave-to {
+  opacity: 0;
+  transform: translateX(-12px);
 }
 
 .icon-enter-active,
