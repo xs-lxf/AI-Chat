@@ -15,6 +15,10 @@ const QWEN_API_KEY = process.env.QWEN_API_KEY?.trim().replace(/^['"]|['"]$/g, ''
 const QWEN_BASE_URL = process.env.QWEN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 const QWEN_MODEL = process.env.QWEN_MODEL || 'qwen-max'
 
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434/v1'
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3.5:9b'
+const OLLAMA_API_KEY = 'ollama'
+
 const PRIMARY_MODEL = process.env.PRIMARY_MODEL || 'qwen'
 let currentModel = PRIMARY_MODEL
 let lastSwitchTime = 0
@@ -80,12 +84,20 @@ app.use(
 app.use(express.json({ limit: '4mb' }))
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, model: currentModel === 'qwen' ? QWEN_MODEL : DEEPSEEK_MODEL, currentModel, qwenReady: !!QWEN_API_KEY, deepseekReady: !!DEEPSEEK_API_KEY })
+  res.json({
+    ok: true,
+    model: currentModel === 'qwen' ? QWEN_MODEL : DEEPSEEK_MODEL,
+    currentModel,
+    models: { qwen: !!QWEN_API_KEY, deepseek: !!DEEPSEEK_API_KEY, ollama: true },
+  })
 })
 
 function getFixedConfig(modelKey) {
   if (modelKey === 'qwen') {
     return { apiKey: QWEN_API_KEY, baseUrl: QWEN_BASE_URL, model: QWEN_MODEL, name: 'Qwen（千问）' }
+  }
+  if (modelKey === 'ollama') {
+    return { apiKey: OLLAMA_API_KEY, baseUrl: OLLAMA_BASE_URL.replace(/\/v1\/?$/, ''), model: OLLAMA_MODEL, name: 'Ollama（本地）', isOllama: true }
   }
   return { apiKey: DEEPSEEK_API_KEY, baseUrl: DEEPSEEK_BASE_URL, model: DEEPSEEK_MODEL, name: 'DeepSeek' }
 }
@@ -143,17 +155,19 @@ app.post('/api/chat', async (req, res) => {
     }
 
     try {
-      const response = await fetch(`${config.baseUrl}/chat/completions`, {
+      const isOllama = config.isOllama
+      const apiUrl = isOllama ? `${config.baseUrl}/api/chat` : `${config.baseUrl}/chat/completions`
+      const body = isOllama
+        ? { model: config.model, messages: fullMessages, stream }
+        : { model: config.model, messages: fullMessages, stream }
+      const headers = isOllama
+        ? { 'Content-Type': 'application/json' }
+        : { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` }
+
+      const response = await fetch(apiUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${config.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: config.model,
-          messages: fullMessages,
-          stream,
-        }),
+        headers,
+        body: JSON.stringify(body),
         signal: ac.signal,
       })
 
@@ -177,14 +191,20 @@ app.post('/api/chat', async (req, res) => {
 
       clearTimeout(timeoutId)
 
+      // ── 非流式 ──
       if (!stream) {
-        const data = await response.json()
+        const raw = await response.json()
+        // Ollama 原生格式 → 转为 OpenAI 兼容格式
+        const data = isOllama
+          ? { choices: [{ message: { role: 'assistant', content: raw.message?.content || '' }, finish_reason: raw.done_reason || 'stop' }] }
+          : raw
         completed = true
         cleanup()
         res.json(data)
         return
       }
 
+      // ── 流式 (SSE) ──
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
@@ -194,10 +214,35 @@ app.post('/api/chat', async (req, res) => {
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        res.write(decoder.decode(value, { stream: true }))
+      if (isOllama) {
+        // Ollama NDJSON → SSE
+        let buf = ''
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() || ''
+          for (const line of lines) {
+            if (!line.trim()) continue
+            try {
+              const chunk = JSON.parse(line)
+              if (chunk.done && chunk.done_reason === 'stop') {
+                res.write('data: [DONE]\n\n')
+              } else if (chunk.message?.content) {
+                const sse = JSON.stringify({ choices: [{ delta: { content: chunk.message.content }, index: 0 }] })
+                res.write(`data: ${sse}\n\n`)
+              }
+            } catch { /* skip malformed */ }
+          }
+        }
+      } else {
+        // OpenAI SSE 透传
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          res.write(decoder.decode(value, { stream: true }))
+        }
       }
 
       completed = true
@@ -242,4 +287,5 @@ app.listen(PORT, () => {
   console.log(`主模型: ${PRIMARY_MODEL === 'qwen' ? 'Qwen（千问）' : 'DeepSeek'} | 当前: ${currentModel === 'qwen' ? 'Qwen（千问）' : 'DeepSeek'}`)
   if (!DEEPSEEK_API_KEY) console.warn('警告: 未设置 DEEPSEEK_API_KEY')
   if (!QWEN_API_KEY) console.warn('警告: 未设置 QWEN_API_KEY')
+  console.log(`Ollama: ${OLLAMA_BASE_URL}/${OLLAMA_MODEL}`)
 })

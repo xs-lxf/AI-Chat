@@ -48,7 +48,7 @@ const messagesRef = ref(null)
 const selectedModel = ref('auto')
 
 const modelLabel = computed(() => {
-  const map = { auto: '⚡ 自动切换', qwen: '千问', deepseek: 'DeepSeek' }
+  const map = { auto: '⚡ 自动切换', qwen: '千问', deepseek: 'DeepSeek', ollama: '本地' }
   return map[selectedModel.value] || '⚡ 自动切换'
 })
 
@@ -245,7 +245,7 @@ function clearChat() {
                 </span>
                 <span class="model-picker">
                   <button
-                    v-for="opt in [['auto','⚡自动'],['qwen','千问'],['deepseek','DS']]"
+                    v-for="opt in [['auto','⚡自动'],['qwen','千问'],['deepseek','DS'],['ollama','本地']]"
                     :key="opt[0]"
                     class="model-opt"
                     :class="{ on: selectedModel === opt[0] }"
