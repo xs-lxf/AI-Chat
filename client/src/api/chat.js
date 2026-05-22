@@ -5,14 +5,15 @@
  * @param {Function} onDone    流结束时回调 () => void
  * @param {Function} onError   出错时回调 (message: string) => void
  * @param {AbortSignal} [signal]  可选，用于外部取消请求
+ * @param {string}   [model]   指定模型：'auto' | 'qwen' | 'deepseek'
  */
-export async function streamChat(messages, onChunk, onDone, onError, signal) {
+export async function streamChat(messages, onChunk, onDone, onError, signal, model) {
   let response
   try {
     response = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages, stream: true }),
+      body: JSON.stringify({ messages, stream: true, model }),
       signal,
     })
   } catch (err) {

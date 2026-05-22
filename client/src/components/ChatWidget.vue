@@ -45,6 +45,12 @@ const sessionCount = computed(() => sessions.value.length)
 
 const isOpen = ref(false)
 const messagesRef = ref(null)
+const selectedModel = ref('auto')
+
+const modelLabel = computed(() => {
+  const map = { auto: '⚡ 自动切换', qwen: '千问', deepseek: 'DeepSeek' }
+  return map[selectedModel.value] || '⚡ 自动切换'
+})
 
 const lastContent = computed(() => messages.value[messages.value.length - 1]?.content ?? '')
 
@@ -186,6 +192,7 @@ async function sendMessage() {
       assistantMsg.content = `错误：${err}`
     },
     ac.signal,
+    selectedModel.value,
   )
 }
 
@@ -229,12 +236,23 @@ function clearChat() {
             <span class="avatar">AI</span>
             <div class="title-info">
               <strong>AI 助手</strong>
-              <span class="status">
-                <svg class="status-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-                  <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
-                </svg>
-                {{ currentSession?.name ?? '新对话' }}
-              </span>
+              <div class="title-meta">
+                <span class="status">
+                  <svg class="status-icon" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+                  </svg>
+                  {{ currentSession?.name ?? '新对话' }}
+                </span>
+                <span class="model-picker">
+                  <button
+                    v-for="opt in [['auto','⚡自动'],['qwen','千问'],['deepseek','DS']]"
+                    :key="opt[0]"
+                    class="model-opt"
+                    :class="{ on: selectedModel === opt[0] }"
+                    @click="selectedModel = opt[0]"
+                  >{{ opt[1] }}</button>
+                </span>
+              </div>
             </div>
           </div>
           <div class="panel-actions">
@@ -490,6 +508,44 @@ function clearChat() {
 .status-icon {
   flex-shrink: 0;
   opacity: 0.5;
+}
+
+.title-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.model-picker {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 1px;
+}
+
+.model-opt {
+  all: unset;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.65rem;
+  line-height: 1.4;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.model-opt:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.model-opt.on {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
 .panel-actions {

@@ -80,18 +80,26 @@ app.use(
 app.use(express.json({ limit: '4mb' }))
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, model: currentModel === 'qwen' ? QWEN_MODEL : DEEPSEEK_MODEL, currentModel })
+  res.json({ ok: true, model: currentModel === 'qwen' ? QWEN_MODEL : DEEPSEEK_MODEL, currentModel, qwenReady: !!QWEN_API_KEY, deepseekReady: !!DEEPSEEK_API_KEY })
 })
 
+function getFixedConfig(modelKey) {
+  if (modelKey === 'qwen') {
+    return { apiKey: QWEN_API_KEY, baseUrl: QWEN_BASE_URL, model: QWEN_MODEL, name: 'Qwen（千问）' }
+  }
+  return { apiKey: DEEPSEEK_API_KEY, baseUrl: DEEPSEEK_BASE_URL, model: DEEPSEEK_MODEL, name: 'DeepSeek' }
+}
+
 app.post('/api/chat', async (req, res) => {
+  const { messages, stream = true, model: reqModel } = req.body
+  const isAuto = !reqModel || reqModel === 'auto'
+
   const now = Date.now()
-  if (currentModel !== PRIMARY_MODEL && now - lastSwitchTime >= FALLBACK_COOLDOWN_MS) {
+  if (isAuto && currentModel !== PRIMARY_MODEL && now - lastSwitchTime >= FALLBACK_COOLDOWN_MS) {
     currentModel = PRIMARY_MODEL
     lastSwitchTime = 0
     console.log(`[模型回切] 已回切到主模型 ${PRIMARY_MODEL === 'qwen' ? 'Qwen（千问）' : 'DeepSeek'}`)
   }
-
-  const { messages, stream = true } = req.body
 
   if (!Array.isArray(messages) || messages.length === 0) {
     res.status(400).json({ error: 'messages 不能为空' })
@@ -119,12 +127,13 @@ app.post('/api/chat', async (req, res) => {
   res.on('close', onClientClose)
 
   let lastError = null
+  const maxAttempts = isAuto ? 2 : 1
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const config = getModelConfig()
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const config = isAuto ? getModelConfig() : getFixedConfig(reqModel)
 
     if (!config.apiKey) {
-      if (attempt === 0) {
+      if (isAuto && attempt === 0) {
         console.warn(`[${config.name}] API 密钥未配置，尝试备用模型`)
         switchToBackup(now)
         continue
@@ -150,7 +159,7 @@ app.post('/api/chat', async (req, res) => {
 
       if (!response.ok) {
         const errText = await response.text()
-        if (attempt === 0 && isOverloadError(response, errText)) {
+        if (isAuto && attempt === 0 && isOverloadError(response, errText)) {
           console.log(`[${config.name}] 负载过高，切换到备用模型重试`)
           switchToBackup(now)
           clearTimeout(timeoutId)
@@ -159,7 +168,10 @@ app.post('/api/chat', async (req, res) => {
         }
         completed = true
         cleanup()
-        res.status(response.status).json({ error: errText || `${config.name} API 请求失败` })
+        const msg = isOverloadError(response, errText)
+          ? `${config.name} 当前负载过高，请切换其他模型或稍后重试`
+          : (errText || `${config.name} API 请求失败`)
+        res.status(response.status).json({ error: msg })
         return
       }
 
@@ -207,7 +219,7 @@ app.post('/api/chat', async (req, res) => {
         return
       }
 
-      if (attempt === 0) {
+      if (isAuto && attempt === 0) {
         console.log(`[${config.name}] 请求异常: ${err.message}，切换到备用模型重试`)
         switchToBackup(now)
         clearTimeout(timeoutId)
@@ -220,7 +232,8 @@ app.post('/api/chat', async (req, res) => {
 
   cleanup()
   if (!res.headersSent) {
-    res.status(503).json({ error: lastError?.message || '所有模型均不可用，请稍后重试' })
+    const isOverload = lastError && isOverloadError({ status: 503 }, lastError.message)
+    res.status(503).json({ error: isOverload ? '当前模型负载过高，请切换其他模型' : (lastError?.message || '所有模型均不可用，请稍后重试') })
   }
 })
 
